@@ -1,4 +1,14 @@
+import { Effect, Layer, Logger, LogLevel, ManagedRuntime, Schema } from "effect"
+import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "@effect/rpc"
+import { HttpServer } from "@effect/platform"
 import { DurableObject } from "cloudflare:workers";
+
+const MyRpcs = RpcGroup.make(
+	Rpc.make("Echo", {
+		success: Schema.Struct({ text: Schema.String }),
+		payload: { text: Schema.String }
+	})
+)
 
 /**
  * Welcome to Cloudflare Workers! This is your first Durable Objects application.
@@ -15,6 +25,8 @@ import { DurableObject } from "cloudflare:workers";
 
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class MyDurableObject extends DurableObject<Env> {
+	readonly runtime: ManagedRuntime.ManagedRuntime<never, never>
+
 	/**
 	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
 	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
@@ -24,6 +36,7 @@ export class MyDurableObject extends DurableObject<Env> {
 	 */
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		this.runtime = ManagedRuntime.make(Layer.empty)
 	}
 
 	/**
@@ -36,7 +49,25 @@ export class MyDurableObject extends DurableObject<Env> {
 	async sayHello(name: string): Promise<string> {
 		return `Hello, ${name}!`;
 	}
+
+	async rpc(): Promise<Uint8Array | ReadableStream> {
+		return Promise.resolve(new Uint8Array())
+	}
 }
+
+const MyRpcsLayer = MyRpcs.toLayer({
+	Echo: ({ text }) => Effect.succeed({ text })
+})
+
+const { handler } = RpcServer.toWebHandler(MyRpcs, {
+	layer: Layer.mergeAll(
+		MyRpcsLayer,
+		RpcSerialization.layerJson,
+		HttpServer.layerContext
+	).pipe(
+		Layer.provideMerge(Logger.minimumLogLevel(LogLevel.All)),
+	),
+})
 
 export default {
 	/**
@@ -48,17 +79,25 @@ export default {
 	 * @returns The response to be sent back to the client
 	 */
 	async fetch(request, env, ctx): Promise<Response> {
-		// Create a stub to open a communication channel with the Durable Object
-		// instance named "foo".
-		//
-		// Requests from all Workers to the Durable Object instance named "foo"
-		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+		const url = new URL(request.url)
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance.
-		const greeting = await stub.sayHello("world");
+		if (request.method === "POST" && url.pathname === "/rpc") {
+			// Create a stub to open a communication channel with the Durable Object
+			// instance named "foo".
+			//
+			// Requests from all Workers to the Durable Object instance named "foo"
+			// will go to a single remote Durable Object instance.
+			const stub = env.MY_DURABLE_OBJECT.getByName("foo");
 
-		return new Response(greeting);
+			// Call the `sayHello()` RPC method on the stub to invoke the method on
+			// the remote Durable Object instance.
+			// const greeting = await stub.sayHello("world");
+
+			const response = await handler(request)
+			console.log(response)
+		}
+
+		return new Response("Not found", { status: 404 })
 	},
 } satisfies ExportedHandler<Env>;
+

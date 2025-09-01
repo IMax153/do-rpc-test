@@ -9,6 +9,9 @@
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {
+		"@effect/platform": "^0.90.6",
+		"@effect/rpc": "^0.69.1",
+		"effect": "^3.17.10",
 		"typescript": "^5.5.2",
 		"wrangler": "^4.33.1"
 	}
