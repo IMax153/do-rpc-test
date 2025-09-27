@@ -1,18 +1,14 @@
-import { ReadableStream } from "@cloudflare/workers-types";
-import { Console, Effect, Layer, ManagedRuntime, Stream } from "effect";
+import { Effect, Layer, Mailbox, ManagedRuntime, Scope, Stream } from "effect";
 import {
-	Rpc,
 	RpcClient,
 	RpcClientError,
-	RpcGroup,
 	RpcMessage,
 	RpcSerialization,
 	RpcServer,
 } from "@effect/rpc";
-import { HttpApp, Headers } from "@effect/platform";
+import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { DurableObject } from "cloudflare:workers";
 import { User, UserRpcs } from "./rpc";
-import { constVoid } from "effect/Function";
 
 /**
  * Welcome to Cloudflare Workers! This is your first Durable Objects application.
@@ -31,6 +27,16 @@ import { constVoid } from "effect/Function";
 export class MyDurableObject extends DurableObject<Env> {
 	readonly runtime: ManagedRuntime.ManagedRuntime<never, never>;
 
+	clientId: number;
+
+	readonly mailbox: Mailbox.Mailbox<{
+		readonly clientId: number;
+		readonly request: string | Uint8Array;
+		readonly controller: ReadableStreamDefaultController;
+	}>;
+
+	readonly interrupts: Mailbox.Mailbox<number>;
+
 	/**
 	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
 	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
@@ -40,60 +46,58 @@ export class MyDurableObject extends DurableObject<Env> {
 	 */
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.runtime = ManagedRuntime.make(Layer.empty);
-	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
-	}
+		this.clientId = 0;
 
-	async rpc(
-		payload: string | Uint8Array,
-	): Promise<Uint8Array | ReadableStream> {
-		return Effect.gen(function* () {
-			const handlersContext = yield* UserRpcs.toLayer({
-				UserById: ({ id }) => Effect.succeed(new User({ id, name: "Max" })),
-				UserCreate: ({ name }) => Effect.succeed(new User({ id: "0", name })),
-				UserList: () =>
-					Stream.forever(
-						Stream.make(new User({ id: "0", name: "Max" })).pipe(
-							Stream.tap(() => Effect.sleep("100 millis")),
+		this.mailbox = Mailbox.make<{
+			readonly clientId: number;
+			readonly request: string | Uint8Array;
+			readonly controller: ReadableStreamDefaultController;
+		}>().pipe(Effect.runSync);
+
+		this.interrupts = Mailbox.make<number>().pipe(Effect.runSync);
+
+		const MainLayer = RpcServer.layer(UserRpcs).pipe(
+			Layer.provide(
+				UserRpcs.toLayer({
+					UserById: ({ id }) => Effect.succeed(new User({ id, name: "Max" })),
+					UserCreate: ({ name }) => Effect.succeed(new User({ id: "0", name })),
+					UserList: () =>
+						Stream.forever(
+							Stream.make(new User({ id: "0", name: "Max" })).pipe(
+								Stream.tap(() => Effect.sleep("100 millis")),
+							),
 						),
-					),
-			}).pipe(Layer.build);
+				}),
+			),
+			Layer.provide(
+				layerProtocolDurableObjectServer(this.mailbox, this.interrupts),
+			),
+			Layer.provide(RpcSerialization.layerNdjson),
+		);
 
-			const parser = RpcSerialization.ndjson.unsafeMake();
+		this.runtime = ManagedRuntime.make(MainLayer);
 
-			const requests = parser.decode(
-				payload,
-			) as Array<RpcMessage.FromClientEncoded>;
-			const request = requests[0];
+		// Start the runtime fibers
+		this.runtime.runFork(Effect.void);
+	}
 
-			if (request._tag === "Request") {
-				const handler = yield* UserRpcs.accessHandler(request.tag as any).pipe(
-					Effect.provide(handlersContext),
-				);
-
-				const response = handler(
-					request.payload as any,
-					Headers.fromInput(request.headers),
-				);
-				if (Effect.isEffect(response)) {
-					return yield* Effect.map(response, (user) => {
-						return parser.encode(user);
-					});
-				}
-			}
-
-			return yield* Effect.succeed(new Uint8Array());
-		}).pipe(Effect.scoped, Effect.runPromise);
+	async rpc(request: string | Uint8Array): Promise<ReadableStream> {
+		const clientId = this.clientId++;
+		const mailbox = this.mailbox;
+		const interrupts = this.interrupts;
+		return new ReadableStream({
+			start(controller) {
+				mailbox.unsafeOffer({
+					clientId,
+					request,
+					controller,
+				});
+			},
+			cancel() {
+				interrupts.unsafeOffer(clientId);
+			},
+		});
 	}
 }
 
@@ -106,7 +110,7 @@ export default {
 	 * @param ctx - The execution context of the Worker
 	 * @returns The response to be sent back to the client
 	 */
-	async fetch(request, env, ctx): Promise<Response> {
+	async fetch(request, env, _ctx): Promise<Response> {
 		const url = new URL(request.url);
 
 		if (request.method === "POST" && url.pathname === "/rpc") {
@@ -114,12 +118,13 @@ export default {
 
 			return Effect.gen(function* () {
 				const memoMap = yield* Layer.makeMemoMap;
-				const scope = yield* Effect.scope;
+				const scope = yield* Scope.make();
 
 				const rpcClientContext = yield* layerProtocolDurableObject({
 					handleRequest: (payload) => stub.rpc(payload),
 				}).pipe(
 					Layer.provideMerge(RpcSerialization.layerNdjson),
+					Layer.provideMerge(Layer.succeed(Scope.Scope, scope)),
 					Layer.buildWithMemoMap(memoMap, scope),
 				);
 
@@ -134,17 +139,24 @@ export default {
 				}).pipe(
 					Layer.provideMerge(RpcServer.layerProtocolHttp({ path: "/rpc" })),
 					Layer.provideMerge(RpcSerialization.layerNdjson),
+					Layer.provideMerge(Layer.succeed(Scope.Scope, scope)),
 					Layer.buildWithMemoMap(memoMap, scope),
 				);
 
 				const handler = yield* RpcServer.toHttpApp(UserRpcs).pipe(
-					Effect.map(HttpApp.toWebHandler),
 					Effect.provide(rpcHandlerContext),
 				);
 
-				return yield* Effect.promise(() => handler(request));
+				const response = yield* handler.pipe(
+					Effect.provideService(Scope.Scope, scope),
+				);
+
+				return HttpServerResponse.toWeb(response);
 			}).pipe(
-				Effect.scoped,
+				Effect.provideService(
+					HttpServerRequest.HttpServerRequest,
+					HttpServerRequest.fromWeb(request),
+				),
 				Effect.tapErrorCause(Effect.logError),
 				Effect.runPromise,
 			);
@@ -157,7 +169,7 @@ export default {
 const makeProtocolDurableObject = (options: {
 	readonly handleRequest: (
 		payload: string | Uint8Array,
-	) => Promise<Uint8Array | ReadableStream>;
+	) => Promise<ReadableStream>;
 }) =>
 	RpcClient.Protocol.make(
 		Effect.fnUntraced(function* (writeResponse) {
@@ -168,33 +180,24 @@ const makeProtocolDurableObject = (options: {
 				request: RpcMessage.FromClientEncoded,
 			) => Effect.Effect<void, RpcClientError.RpcClientError> =
 				Effect.fnUntraced(function* (request) {
-					switch (request._tag) {
-						case "Request": {
-							const payload = parser.encode(request);
-							if (payload === undefined) {
-								return yield* Effect.void;
-							}
-							const result = yield* Effect.promise(() =>
-								options.handleRequest(payload),
-							);
-							if (result instanceof Uint8Array) {
-								const responses = parser.decode(
-									result,
-								) as Array<RpcMessage.FromServerEncoded>;
-								if (responses.length === 0) {
-									return yield* Effect.void;
-								}
-								let i = 0;
-								return yield* Effect.whileLoop({
-									while: () => i < responses.length,
-									body: () => writeResponse(responses[i++]),
-									step: constVoid,
-								});
-							}
+					if (request._tag === "Ping") return;
+					const payload = parser.encode(request);
+					if (payload === undefined) return;
+					const result = yield* Effect.promise(() =>
+						options.handleRequest(payload),
+					);
+					let reader = result.getReader();
+					const read = Effect.promise(() => reader.read());
+					while (true) {
+						const response = yield* read;
+						if (response.done) {
 							break;
 						}
-						case "Interrupt": {
-							break;
+						const decoded = parser.decode(
+							response.value,
+						) as Array<RpcMessage.FromServerEncoded>;
+						for (const message of decoded) {
+							yield* writeResponse(message);
 						}
 					}
 				});
@@ -210,5 +213,119 @@ const makeProtocolDurableObject = (options: {
 const layerProtocolDurableObject = (options: {
 	readonly handleRequest: (
 		payload: string | Uint8Array,
-	) => Promise<Uint8Array | ReadableStream>;
+	) => Promise<ReadableStream>;
 }) => Layer.effect(RpcClient.Protocol, makeProtocolDurableObject(options));
+
+const makeProtocolDurableObjectServer = Effect.fnUntraced(function* (
+	mailbox: Mailbox.Mailbox<{
+		readonly clientId: number;
+		readonly request: string | Uint8Array;
+		readonly controller: ReadableStreamDefaultController;
+	}>,
+	interrupts: Mailbox.Mailbox<number>,
+) {
+	const serialization = yield* RpcSerialization.RpcSerialization;
+	const parser = serialization.unsafeMake();
+
+	const disconnects = yield* Mailbox.make<number>();
+	let writeRequest!: (
+		clientId: number,
+		message: RpcMessage.FromClientEncoded,
+	) => Effect.Effect<void>;
+
+	const clients = new Map<
+		number,
+		{
+			readonly clientId: number;
+			readonly request: RpcMessage.RequestEncoded;
+			readonly controller: ReadableStreamDefaultController;
+		}
+	>();
+
+	yield* mailbox.take.pipe(
+		Effect.flatMap(
+			Effect.fnUntraced(function* (request) {
+				const decoded = parser.decode(
+					request.request,
+				) as ReadonlyArray<RpcMessage.FromClientEncoded>;
+
+				const message = decoded[0];
+
+				if (message._tag !== "Request") return;
+
+				clients.set(request.clientId, {
+					...request,
+					request: message,
+				});
+
+				yield* writeRequest(request.clientId, message);
+				yield* writeRequest(request.clientId, RpcMessage.constEof);
+			}),
+		),
+		Effect.forever,
+		Effect.interruptible,
+		Effect.forkScoped,
+	);
+
+	yield* interrupts.take.pipe(
+		Effect.flatMap(
+			Effect.fnUntraced(function* (clientId) {
+				const client = clients.get(clientId);
+				if (!client) return;
+				yield* writeRequest(clientId, {
+					_tag: "Interrupt",
+					requestId: client.request.id,
+				});
+			}),
+		),
+		Effect.forever,
+		Effect.interruptible,
+		Effect.forkScoped,
+	);
+
+	const protocol = yield* RpcServer.Protocol.make((writeRequest_) => {
+		writeRequest = writeRequest_;
+		return Effect.succeed({
+			disconnects,
+			clientIds: Effect.sync(() => clients.keys()),
+			send: (clientId, response) => {
+				const client = clients.get(clientId);
+				if (!client) return Effect.void;
+				const encoded = parser.encode(response);
+				if (!encoded) return Effect.void;
+				client.controller.enqueue(
+					typeof encoded === "string"
+						? new TextEncoder().encode(encoded)
+						: encoded,
+				);
+				return Effect.void;
+			},
+			end(clientId) {
+				const client = clients.get(clientId);
+				if (!client) return Effect.void;
+				client.controller.close();
+				clients.delete(clientId);
+				return Effect.void;
+			},
+			initialMessage: Effect.succeedNone,
+			supportsAck: false,
+			supportsTransferables: false,
+			supportsSpanPropagation: false,
+		});
+	});
+
+	return protocol;
+});
+
+const layerProtocolDurableObjectServer = (
+	mailbox: Mailbox.Mailbox<{
+		readonly clientId: number;
+		readonly request: string | Uint8Array;
+		readonly controller: ReadableStreamDefaultController;
+	}>,
+	interrupts: Mailbox.Mailbox<number>,
+) =>
+	Layer.scoped(
+		RpcServer.Protocol,
+		makeProtocolDurableObjectServer(mailbox, interrupts),
+	);

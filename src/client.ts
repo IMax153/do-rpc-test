@@ -17,11 +17,10 @@ const ProtocolLive = RpcClient.layerProtocolHttp({
 // Use the client
 const program = Effect.gen(function* () {
 	const client = yield* RpcClient.make(UserRpcs);
-	console.log(yield* client.UserById({ id: "0" }));
-	// yield* client.UserList().pipe(
-	// 	Stream.take(3),
-	// 	Stream.runForEach((user) => Console.log(user)),
-	// );
+	yield* client.UserList().pipe(
+		Stream.take(3),
+		Stream.runForEach((user) => Console.log(user)),
+	);
 }).pipe(Effect.scoped);
 
 program.pipe(
